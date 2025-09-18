@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "WhatsApp Privacy Extension",
-  "version": "1.0",
+  "version": "1.2",
   "description": "Enhance your WhatsApp privacy settings",
   "action": {
     "default_popup": "index.html",

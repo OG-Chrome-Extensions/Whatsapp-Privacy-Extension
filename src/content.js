@@ -1,10 +1,11 @@
-console.log("injected content scripd")
+console.log("injected content script")
 const SELECTORS = {
   allMessages: [
-    "._ao3e.selectable-text.copyable-text",
     ".quoted-mention._ao3e",
     "._ajv1 span.copyable-text.copyable-text",
     "._ak72 > span.copyable-text",
+    "._akbu.x6ikm8r.x10wlt62",
+    ".x1rg5ohu.x16dsc37",
   ],
   lastPreview: [
     "div._ak8j > div._ak8k > span[title] > span._ao3e",
@@ -24,9 +25,7 @@ const SELECTORS = {
     '[data-testid="media-viewer-image"]',
 
     // Videos
-    "video:not([aria-hidden])",
-    '[data-testid="video-thumb"]',
-    '[data-testid="media-viewer-video"]',
+    '._amk4.false._amkv',
 
     // Documents
     'div[title^="Download"]', // Document download containers
@@ -203,6 +202,7 @@ function setupHoverEffect() {
     const el = allSelectors.map((sel) => e.target.closest(sel)).find(Boolean);
     if (el?.dataset.originalFilter && !isInactiveBlurred) {
       el.style.filter = "none";
+      // console.log("Hovering:", el, "Original filter:", el?.dataset.originalFilter);
     }
   });
 
