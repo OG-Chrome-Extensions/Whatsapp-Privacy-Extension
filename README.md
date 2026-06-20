@@ -1,6 +1,6 @@
-# 🔒 WhatsApp Privacy Extension
+# 🔒 Blur for WhatsApp Web – Privacy, Hide Chats & PIN Lock
 
-A privacy-focused Chrome extension that lets you **take full control over your WhatsApp Web experience**. Blur or hide sensitive elements on the screen with ease — fully customizable and built with privacy and performance in mind.
+A privacy-focused Chrome extension to **blur or hide WhatsApp Web messages, media, contact names and chat previews**. Lock reveal and settings behind a **4-digit PIN**, auto-blur when idle, and choose exactly what you hide — fully customizable and built with privacy and performance in mind.
 
 ---
 

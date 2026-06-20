@@ -1,26 +1,61 @@
 console.log("Background script loaded");
 
-// Set default settings when the extension is first installed
-chrome.runtime.onInstalled.addListener(() => {
-  chrome.storage.sync.set({
-    globalToggle: true,
-    settings: {
-      allMessages: true,
-      lastPreview: false,
-      mediaPreview: true,
-      mediaGallery: true,
-      textInput: true,
-      profilePictures: false,
-      groupNames: false,
-      noTransition: false,
-      unblurOnHover: false,
-      blurOnIdle: false
-    },
-     blurValues: {
-      'blur amount': 8,
-      'idle timeout': 10
-    }
-  });
+const DEFAULT_SETTINGS = {
+  allMessages: true,
+  lastPreview: false,
+  mediaPreview: true,
+  mediaGallery: true,
+  textInput: true,
+  profilePictures: false,
+  groupNames: false,
+  noTransition: false,
+  unblurOnHover: false,
+  blurOnIdle: false,
+};
+
+const DEFAULT_BLUR_VALUES = { "blur amount": 8, "idle timeout": 10 };
+
+const DEFAULT_SECURITY = {
+  pinEnabled: false,
+  pinHash: "",
+  pinSalt: "",
+  recoveryHash: "",
+  recoverySalt: "",
+  relockMode: "idle",
+  relockTimerMinutes: 5,
+  blurAllWhenLocked: false,
+};
+
+// Seed defaults only for keys that are missing, so updating the extension
+// never wipes the user's settings or PIN.
+chrome.runtime.onInstalled.addListener(async () => {
+  const sync = await chrome.storage.sync.get([
+    "globalToggle",
+    "settings",
+    "blurValues",
+  ]);
+  const syncPatch = {};
+  if (sync.globalToggle === undefined) syncPatch.globalToggle = true;
+  if (!sync.settings) syncPatch.settings = DEFAULT_SETTINGS;
+  if (!sync.blurValues) syncPatch.blurValues = DEFAULT_BLUR_VALUES;
+  if (Object.keys(syncPatch).length) chrome.storage.sync.set(syncPatch);
+
+  const local = await chrome.storage.local.get("wpeSecurity");
+  if (!local.wpeSecurity) {
+    chrome.storage.local.set({
+      wpeSecurity: DEFAULT_SECURITY,
+      wpeLock: { locked: false, unlockedUntil: null },
+      wpeAttempts: { count: 0, lockedUntil: null },
+    });
+  }
+});
+
+// Re-lock when a WhatsApp tab closes, so reopening requires the PIN again.
+chrome.tabs.onRemoved.addListener(async () => {
+  const { wpeSecurity } = await chrome.storage.local.get("wpeSecurity");
+  if (wpeSecurity?.pinEnabled) {
+    chrome.storage.local.set({ wpeLock: { locked: true, unlockedUntil: null } });
+  }
 });
 
 

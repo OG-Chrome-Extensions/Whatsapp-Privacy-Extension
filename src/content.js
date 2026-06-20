@@ -1,4 +1,15 @@
-console.log("injected content script")
+// WhatsApp Privacy Extension — content script
+// Stability refactor (Phase 1):
+//  - Blur is driven by a single injected stylesheet + marker classes, not by
+//    rewriting inline `style.filter` on every element.
+//  - Blur amount is a CSS variable, so changing it is one property write
+//    instead of a full DOM re-walk.
+//  - MutationObserver work is coalesced into a single rAF pass.
+
+// ---------------------------------------------------------------------------
+// Selectors. Each key maps to the elements that setting should blur.
+// Centralized here so a WhatsApp DOM change is a one-file fix.
+// ---------------------------------------------------------------------------
 const SELECTORS = {
   allMessages: [
     ".quoted-mention._ao3e",
@@ -6,6 +17,12 @@ const SELECTORS = {
     "._ak72 > span.copyable-text",
     "._akbu.x6ikm8r.x10wlt62",
     ".x1rg5ohu.x16dsc37",
+    // Broad, resilient message-text catches (incl. image/media captions),
+    // scoped to the open conversation so the rest of the UI is untouched.
+    "#main span.selectable-text.copyable-text",
+    "#main span.selectable-text",
+    "#main div.copyable-text > span",
+    '#main [data-testid="media-caption"]',
   ],
   lastPreview: [
     "div._ak8j > div._ak8k > span[title] > span._ao3e",
@@ -23,19 +40,19 @@ const SELECTORS = {
     'img[src^="blob:"]:not([aria-hidden])',
     '[data-testid="image-thumb"]',
     '[data-testid="media-viewer-image"]',
-
     // Videos
-    '._amk4.false._amkv',
-
+    "._amk4.false._amkv",
     // Documents
-    'div[title^="Download"]', // Document download containers
-    'span[data-icon^="document-"]', // Document icons
-    'div[aria-label*="document"]', // Document labels
-
-    // Links
-    'a[href*="whatsapp"] div[role="button"]', // Link previews
+    'div[title^="Download"]',
+    'span[data-icon^="document-"]',
+    'div[aria-label*="document"]',
+    // Links (preview cards + in-message anchors, scoped to the chat pane)
     '[data-testid="link-preview"]',
     "div._ak4a.x121pien",
+    'a[href*="whatsapp"] div[role="button"]',
+    '#main a[href^="http"]',
+    '#main div[role="row"] a[href]',
+    'a[href^="http"][target="_blank"]',
     'div[aria-label="Voice message"]',
     'button[aria-label="Play voice message"]',
     'span[data-icon="audio-play"]',
@@ -46,355 +63,525 @@ const SELECTORS = {
     '[data-testid="media-viewer-image"]',
     '[data-testid="media-viewer-video"]',
     'div[data-testid="media-gallery"] div[style*="background-image"]',
-    // Links
-    'a[href*="whatsapp"] div[role="button"]', // Link previews
     '[data-testid="link-preview"]',
     "div._ak4a.x121pien",
+    'a[href*="whatsapp"] div[role="button"]',
+    '#main a[href^="http"]',
+    '#main div[role="row"] a[href]',
+    'a[href^="http"][target="_blank"]',
     'div[aria-label="Voice message"]',
     'button[aria-label="Play voice message"]',
     'span[data-icon="audio-play"]',
-    // Documents
-    'div[title^="Download"]', // Document download containers
-    'span[data-icon^="document-"]', // Document icons
-    'div[aria-label*="document"]', // Document labels
+    'div[title^="Download"]',
+    'span[data-icon^="document-"]',
+    'div[aria-label*="document"]',
   ],
   textInput: [
-    // Add selectors for text input
-    'div[contenteditable="true"]', // Main input area
-    "._ak1k", // Maybe reply input
+    'div[contenteditable="true"]',
+    "._ak1k",
   ],
   profilePictures: [
-    // Main profile pictures (chat list and headers)
     'img._ao3e[src*="whatsapp.net"][draggable="false"]',
     'img.x1lliihq[src*="whatsapp.net"]',
     'div[style*="height: 40px; width: 40px"] img._ao3e',
-
-    // Fallbacks and alternative locations
     'div[data-testid="chat-list-item"] img[alt=""]',
     'header[data-testid="conversation-header"] img[alt=""]',
     "div.x1n2onr6.x1c9tyrk img.xeusxvb",
-
-    // Group profile picture indicators
     'div.x1iyjqo2 > div.x78zum5 > div > svg[aria-label="group"]',
-
-    // Status/profile view pictures
     'div[aria-label="Profile photo"] img',
     'div[data-testid="status-thumb"] img',
   ],
   groupNames: [
-    // Primary selectors (chat list items)
-    'div._ak8q span._ao3e[dir="auto"][title]', // Your specific case
+    'div._ak8q span._ao3e[dir="auto"][title]',
     'div[data-testid="chat-list-item"] span[title]',
     'div[role="row"] span._ao3e[dir="auto"]',
-
-    // Chat header names
     'header[data-testid="conversation-header"] span._ao3e',
     'div[data-testid="conversation-info-header"] span[title]',
-
-    // Alternative selectors
-    'span.x1iyjqo2.x6ikm8r._ao3e[dir="auto"]', // Common name structure
-    "div.x78zum5.x1q0g3np span._ao3e", // Container-based
-
-    // Pinned/Unread indicators (from your example)
-    'div._ahlk[aria-label="Pinned chat"]', // Pinned chats
-    'span[aria-label*="unread messages"]', // Unread count
-
-    // Fallback selectors
+    'span.x1iyjqo2.x6ikm8r._ao3e[dir="auto"]',
+    "div.x78zum5.x1q0g3np span._ao3e",
+    'div._ahlk[aria-label="Pinned chat"]',
+    'span[aria-label*="unread messages"]',
     'div[aria-label="Chat list"] span[title]',
     "span.x1rg5ohu.xjnfcd9.x1n2onr6._ao3e",
   ],
 };
 
+const ALL_SELECTORS = Object.values(SELECTORS).flat();
+
+// ---------------------------------------------------------------------------
+// CSS class names. Marker classes carry no styling of their own except via the
+// `[class*="wpe-k-"]` base rule, so toggling blur on an element is just a
+// classList add/remove.
+// ---------------------------------------------------------------------------
+const MARK_PREFIX = "wpe-k-"; // e.g. wpe-k-allMessages, wpe-k-idle
+const REVEAL_CLASS = "wpe-reveal"; // per-element hover reveal
+const ROOT_NO_TRANSITION = "wpe-no-transition";
+const ROOT_APP_HOVER = "wpe-app-hover"; // unblur-everything while app hovered
+const STYLE_ID = "wpe-style";
+const DEFAULT_BLUR = 8;
+const DEFAULT_IDLE_SECONDS = 10;
+
+// ---------------------------------------------------------------------------
+// State
+// ---------------------------------------------------------------------------
 let observer = null;
 let activeSettings = null;
 let globalEnabled = false;
-
-let isInactiveBlurred = false;
-let appHoverTimer; //useless
-let inactivityTimer;
-const APP_HOVER_DELAY = 100;
-let BLUR_AMOUNT = 8;
-let INACTIVITY_TIMEOUT = 10000;
+let isIdleBlurred = false;
 let isAppHovered = false;
-let lastAppliedBlurAmount = null;
+let inactivityTimer = null;
+let relockTimer = null;
+let lastKeepAlive = 0; // heartbeat from an open settings/options page
+let mutationScheduled = false;
 
+let blurAmount = DEFAULT_BLUR;
+let inactivityTimeout = DEFAULT_IDLE_SECONDS * 1000;
 
-// Improved blur application that respects inactive state
-function applyBlurToElements(selectors, blurValue , key) {
-  if (!selectors || selectors.length === 0) return;
-  // Prevent blur if unblurOnHover is on and app is hovered
+// PIN-lock state mirrored from chrome.storage.local (written by the popup/options
+// page via the lock library). content.js only reads it — never hashes anything.
+const SECURITY_DEFAULTS = {
+  pinEnabled: false,
+  relockMode: "idle",
+  relockTimerMinutes: 5,
+  blurAllWhenLocked: false,
+};
+let securityCfg = { ...SECURITY_DEFAULTS };
+let lockState = { locked: false, unlockedUntil: null };
 
-  selectors.forEach((selector) => {
-    document.querySelectorAll(selector).forEach((el) => {
-      const className = `privacy-blurred-${key}`;
-      if (!el.classList.contains(className)) {
-        // Don't override inactive blur
-        if (!isInactiveBlurred || key === "inactive") {
-          el.style.filter = `blur(${blurValue}px)`;
-          el.dataset.originalFilter = `blur(${blurValue}px)`;
-          console.log("bulur amount inside fun ",blurValue)
-        }
-        el.style.transition = activeSettings.noTransition
-          ? "none"
-          : "filter 0.3s ease";
-        el.classList.add(className);
-      }
-    });
-  });
+function isLocked() {
+  if (!securityCfg?.pinEnabled) return false;
+  if (lockState?.locked) return true;
+  if (lockState?.unlockedUntil && Date.now() >= lockState.unlockedUntil) return true;
+  return false;
 }
 
-function removeBlurFromElements(key) {
-  document.querySelectorAll(`.privacy-blurred-${key}`).forEach((el) => {
-    // Only remove blur if not inactive (unless we're specifically removing inactive)
-    if (!isInactiveBlurred || key === "inactive") {
-      el.style.filter = "";
-      delete el.dataset.originalFilter;
+// ---------------------------------------------------------------------------
+// Stylesheet
+// ---------------------------------------------------------------------------
+function injectStyles() {
+  if (document.getElementById(STYLE_ID)) return;
+  const style = document.createElement("style");
+  style.id = STYLE_ID;
+  style.textContent = `
+    [class*="${MARK_PREFIX}"] {
+      filter: blur(var(--wpe-blur-amount, ${DEFAULT_BLUR}px)) !important;
+      transition: filter 0.3s ease;
     }
-    el.classList.remove(`privacy-blurred-${key}`);
+    .${ROOT_NO_TRANSITION} [class*="${MARK_PREFIX}"] {
+      transition: none !important;
+    }
+    /* Per-element hover reveal wins on specificity (class + attr). Also clear
+       any marked descendants so nested blurs reveal together. */
+    .${REVEAL_CLASS}[class*="${MARK_PREFIX}"],
+    .${REVEAL_CLASS} [class*="${MARK_PREFIX}"] {
+      filter: none !important;
+    }
+    /* Reveal everything while the whole app is hovered. */
+    .${ROOT_APP_HOVER} [class*="${MARK_PREFIX}"] {
+      filter: none !important;
+    }
+  `;
+  (document.head || document.documentElement).appendChild(style);
+}
+
+function setBlurAmount(px) {
+  document.documentElement.style.setProperty("--wpe-blur-amount", `${px}px`);
+}
+
+function updateRootClasses() {
+  const root = document.documentElement;
+  root.classList.toggle(ROOT_NO_TRANSITION, !!activeSettings?.noTransition);
+  root.classList.toggle(
+    ROOT_APP_HOVER,
+    !!activeSettings?.unblurOnHover && isAppHovered && !isIdleBlurred && !isLocked()
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Marker management
+// ---------------------------------------------------------------------------
+function markKey(key) {
+  const selectors = SELECTORS[key];
+  if (!selectors) return;
+  const cls = MARK_PREFIX + key;
+  selectors.forEach((selector) => {
+    let nodes;
+    try {
+      nodes = document.querySelectorAll(selector);
+    } catch {
+      return; // skip a selector WhatsApp may have invalidated
+    }
+    nodes.forEach((el) => el.classList.add(cls));
   });
 }
 
-// Modified to handle inactive state properly
+function unmarkKey(key) {
+  document
+    .querySelectorAll(`.${MARK_PREFIX}${key}`)
+    .forEach((el) => el.classList.remove(MARK_PREFIX + key));
+}
+
+function removeAllMarkers() {
+  document.querySelectorAll(`[class*="${MARK_PREFIX}"]`).forEach((el) => {
+    // Use classList (works on SVG too, where className is an SVGAnimatedString).
+    Array.from(el.classList)
+      .filter((c) => c.startsWith(MARK_PREFIX))
+      .forEach((c) => el.classList.remove(c));
+    el.classList.remove(REVEAL_CLASS);
+  });
+}
+
+// Apply blur markers for the current settings. Cheap and idempotent — adding a
+// class that already exists is a no-op, so this is safe to call on every
+// mutation pass.
 function applyBlurBasedOnSettings() {
   if (!globalEnabled || !activeSettings) {
-    Object.keys(SELECTORS).forEach((key) => removeBlurFromElements(key));
-  lastAppliedBlurAmount = null; // Reset
+    removeAllMarkers();
     return;
   }
 
-  const blurChanged = lastAppliedBlurAmount !== BLUR_AMOUNT;
-
-  //  If blur amount changed, remove all current blur before reapplying
-  if (blurChanged) {
-    
-    Object.entries(activeSettings).forEach(([key, value]) => {
-      if (SELECTORS[key] && key !== "blurOnIdle" && value) {
-        removeBlurFromElements(key); // remove old blur class
-      }
-    });
-  }
-
-  // Always apply blur or remove based on current settings
-  Object.entries(activeSettings).forEach(([key, value]) => {
-    if (SELECTORS[key] && key !== "blurOnIdle") {
-      if (value) {
-        applyBlurToElements(SELECTORS[key], BLUR_AMOUNT, key); // now reapply with new amount
-      } else {
-        removeBlurFromElements(key);
-      }
-    }
+  Object.keys(SELECTORS).forEach((key) => {
+    if (activeSettings[key]) markKey(key);
+    else unmarkKey(key);
   });
 
-  //  Update stored value for next comparison
-  lastAppliedBlurAmount = BLUR_AMOUNT;
+  // Blur everything (regardless of individual toggles) when idle, or when the
+  // PIN lock is engaged and "blur all while locked" is on.
+  const blurAll =
+    isIdleBlurred || (isLocked() && securityCfg?.blurAllWhenLocked);
+  if (blurAll) markIdle();
+  else unmarkIdle();
 
-  // Handle inactive blur separately if needed
-  if (activeSettings.blurOnIdle && isInactiveBlurred) {
-    applyBlurToElements(Object.values(SELECTORS).flat(), 8, "inactive");
+  updateRootClasses();
+}
+
+function markIdle() {
+  ALL_SELECTORS.forEach((selector) => {
+    let nodes;
+    try {
+      nodes = document.querySelectorAll(selector);
+    } catch {
+      return;
+    }
+    nodes.forEach((el) => el.classList.add(`${MARK_PREFIX}idle`));
+  });
+}
+
+function unmarkIdle() {
+  document
+    .querySelectorAll(`.${MARK_PREFIX}idle`)
+    .forEach((el) => el.classList.remove(`${MARK_PREFIX}idle`));
+}
+
+// ---------------------------------------------------------------------------
+// Hover reveal (per element). Disabled while idle-blurred.
+// ---------------------------------------------------------------------------
+function closestBlurred(target) {
+  for (const sel of ALL_SELECTORS) {
+    let match;
+    try {
+      match = target.closest(sel);
+    } catch {
+      continue;
+    }
+    if (match) return match;
+  }
+  return null;
+}
+
+let hoverRevealed = null;
+
+// The highest marked ancestor of `target`, so revealing it (plus the CSS rule
+// that clears marked descendants) un-blurs the whole nested element at once.
+function topBlurred(target) {
+  let node = target;
+  let top = null;
+  while (node && node.nodeType === 1) {
+    if (node.matches && node.matches(`[class*="${MARK_PREFIX}"]`)) top = node;
+    node = node.parentElement;
+  }
+  return top;
+}
+
+function handleMouseOver(e) {
+  if (!globalEnabled || isIdleBlurred) return;
+  // While locked, hovering a blurred element prompts for the PIN.
+  if (isLocked()) {
+    if (closestBlurred(e.target)) showUnlockOverlay();
+    return;
+  }
+  const el = topBlurred(e.target);
+  if (el && el !== hoverRevealed) {
+    if (hoverRevealed) hoverRevealed.classList.remove(REVEAL_CLASS);
+    hoverRevealed = el;
+    el.classList.add(REVEAL_CLASS);
   }
 }
 
-// Improved hover effect that respects other toggles
+// ---------------------------------------------------------------------------
+// In-page unlock overlay (an extension iframe hosting the PIN keypad).
+// ---------------------------------------------------------------------------
+let unlockIframe = null;
+
+function showUnlockOverlay() {
+  if (unlockIframe) return;
+  unlockIframe = document.createElement("iframe");
+  unlockIframe.src = chrome.runtime.getURL("unlock.html");
+  Object.assign(unlockIframe.style, {
+    position: "fixed",
+    top: "0",
+    left: "0",
+    width: "100%",
+    height: "100%",
+    border: "0",
+    background: "transparent",
+    zIndex: "2147483647",
+  });
+  document.documentElement.appendChild(unlockIframe);
+}
+
+function hideUnlockOverlay() {
+  if (unlockIframe) {
+    unlockIframe.remove();
+    unlockIframe = null;
+  }
+}
+
+window.addEventListener("message", (e) => {
+  const type = e?.data?.type;
+  if (type === "wpe-unlocked" || type === "wpe-cancel") {
+    hideUnlockOverlay();
+    // On unlock, applyUnlock already wrote storage; onChanged re-applies blur.
+  }
+});
+
+function handleMouseOut(e) {
+  // While app-hover reveal-all is active, leave reveal handling to the root class.
+  if (activeSettings?.unblurOnHover && isAppHovered) return;
+  // Re-blur only when the pointer truly leaves the revealed element.
+  if (hoverRevealed && !hoverRevealed.contains(e.relatedTarget)) {
+    hoverRevealed.classList.remove(REVEAL_CLASS);
+    hoverRevealed = null;
+  }
+}
+
 function setupHoverEffect() {
-  const allSelectors = Object.values(SELECTORS).flat();
-
-  document.addEventListener("mouseover", (e) => {
-    const el = allSelectors.map((sel) => e.target.closest(sel)).find(Boolean);
-    if (el?.dataset.originalFilter && !isInactiveBlurred) {
-      el.style.filter = "none";
-      // console.log("Hovering:", el, "Original filter:", el?.dataset.originalFilter);
-    }
-  });
-
-  document.addEventListener("mouseout", (e) => {
-    const el = allSelectors.map((sel) => e.target.closest(sel)).find(Boolean);
-   
-    if (activeSettings.unblurOnHover && isAppHovered) return;
-
-
-    if (el?.dataset.originalFilter && !isInactiveBlurred) {
-      el.style.filter = el.dataset.originalFilter;
-    }
-  });
+  document.removeEventListener("mouseover", handleMouseOver);
+  document.removeEventListener("mouseout", handleMouseOut);
+  document.addEventListener("mouseover", handleMouseOver);
+  document.addEventListener("mouseout", handleMouseOut);
 }
 
-// Improved inactivity blur
-function setupInactivityBlur() {
-  const resetTimer = () => {
-    if (!activeSettings.blurOnIdle || !globalEnabled) return;
-
-    clearTimeout(inactivityTimer);
-
-    //  Remove only idle-related blur
-    document.querySelectorAll(".privacy-blurred-inactive").forEach((el) => {
-      el.style.filter = "";
-      el.classList.remove("privacy-blurred-inactive");
-    });
-
-    //  Restore saved setting-based blur
-    applyBlurBasedOnSettings();
-
-    inactivityTimer = setTimeout(() => {
-      if (globalEnabled && activeSettings.blurOnIdle) {
-        const alreadyBlurred = new Set();
-        Object.keys(activeSettings).forEach((key) => {
-          if (activeSettings[key]) {
-            document
-              .querySelectorAll(`.privacy-blurred-${key}`)
-              .forEach((el) => alreadyBlurred.add(el));
-          }
-        });
-
-        const allSelectors = Object.values(SELECTORS).flat();
-        allSelectors.forEach((sel) => {
-          document.querySelectorAll(sel).forEach((el) => {
-            if (!alreadyBlurred.has(el)) {
-              el.style.filter = "blur(8px)";
-              el.classList.add("privacy-blurred-inactive");
-            }
-          });
-        });
-      }
-    }, INACTIVITY_TIMEOUT);
-  };
-
-  // Event listeners
-  ["mousemove", "keydown", "click", "scroll", "touchstart", "wheel"].forEach(
-    (event) => {
-      window.addEventListener(event, resetTimer, { passive: true });
-    }
-  );
-
-  resetTimer(); // Initialize
+// ---------------------------------------------------------------------------
+// App-hover: reveal everything while the cursor is anywhere in the app.
+// Implemented purely with a root class — no per-element bookkeeping.
+// ---------------------------------------------------------------------------
+function handleAppEnter() {
+  if (!activeSettings?.unblurOnHover || !globalEnabled) return;
+  isAppHovered = true;
+  updateRootClasses();
 }
 
-// Improved app hover
+function handleAppLeave() {
+  isAppHovered = false;
+  updateRootClasses();
+}
+
 function setupAppHover() {
-  const appContainer =
-    document.querySelector("#app, .app-wrapper") || document.body;
-  console.log(" setupAppHover initialized");
+  const root = document.documentElement;
+  root.removeEventListener("mouseenter", handleAppEnter);
+  root.removeEventListener("mouseleave", handleAppLeave);
+  root.addEventListener("mouseenter", handleAppEnter);
+  root.addEventListener("mouseleave", handleAppLeave);
+}
 
-  const handleMouseEnter = () => {
-    if (!activeSettings.unblurOnHover || !globalEnabled) return;
-    isAppHovered = true;
+// ---------------------------------------------------------------------------
+// Activity → idle blur + PIN re-lock
+// ---------------------------------------------------------------------------
+const IDLE_EVENTS = ["mousemove", "keydown", "click", "scroll", "touchstart", "wheel"];
 
-    clearTimeout(appHoverTimer);
+// Persist a new lock state and re-apply immediately (the storage write also
+// notifies any other tab via the onChanged listener).
+function setLockedState(locked) {
+  lockState = { locked, unlockedUntil: null };
+  chrome.storage.local.set({ wpeLock: lockState });
+  applyBlurBasedOnSettings();
+}
 
-    Object.keys(SELECTORS).forEach((key) => {
-      document.querySelectorAll(`.privacy-blurred-${key}`).forEach((el) => {
-        // Save current blur filter before removing
-        if (!el.dataset.originalFilter) {
-          el.dataset.originalFilter = el.style.filter || "blur(8px)";
-        }
+// Arm the re-lock timer for the current mode. idle/immediate reset on activity;
+// timer uses the unlock deadline; session never auto-locks.
+function scheduleRelock() {
+  clearTimeout(relockTimer);
+  if (!securityCfg?.pinEnabled || isLocked()) return;
+  const mode = securityCfg.relockMode;
+  if (mode === "session") return;
 
-        el.style.filter = "none";
-      });
-    });
-    console.log("Unblurred screen on mouse enter");
-  };
+  let delay;
+  if (mode === "idle") delay = inactivityTimeout;
+  else if (mode === "immediate") delay = 3000;
+  else {
+    const until =
+      lockState?.unlockedUntil ||
+      Date.now() + (securityCfg.relockTimerMinutes || 5) * 60000;
+    delay = Math.max(0, until - Date.now());
+  }
+  relockTimer = setTimeout(() => {
+    // Defer if the settings page is actively open (recent heartbeat).
+    if (Date.now() - lastKeepAlive < 8000) {
+      scheduleRelock();
+      return;
+    }
+    setLockedState(true);
+  }, delay);
+}
 
-  const handleMouseLeave = () => {
-    if (!activeSettings.unblurOnHover || !globalEnabled) return;
-    isAppHovered = false;
+function onActivity() {
+  // Visual idle blur.
+  if (globalEnabled && activeSettings?.blurOnIdle) {
+    clearTimeout(inactivityTimer);
+    if (isIdleBlurred) {
+      isIdleBlurred = false;
+      applyBlurBasedOnSettings();
+    }
+    inactivityTimer = setTimeout(() => {
+      if (globalEnabled && activeSettings?.blurOnIdle) {
+        isIdleBlurred = true;
+        applyBlurBasedOnSettings();
+      }
+    }, inactivityTimeout);
+  }
 
+  // Re-lock on inactivity for idle/immediate modes.
+  const mode = securityCfg?.relockMode;
+  if (
+    securityCfg?.pinEnabled &&
+    !isLocked() &&
+    (mode === "idle" || mode === "immediate")
+  ) {
+    scheduleRelock();
+  }
+}
 
-    appHoverTimer = setTimeout(() => {
-      Object.keys(SELECTORS).forEach((key) => {
-        document.querySelectorAll(`.privacy-blurred-${key}`).forEach((el) => {
-          const filter = el.dataset.originalFilter || "blur(8px)";
-          el.style.filter = filter;
-        });
-      });
-     
-    }, APP_HOVER_DELAY);
-  };
+function setupActivity() {
+  IDLE_EVENTS.forEach((event) =>
+    window.removeEventListener(event, onActivity)
+  );
+  if (!activeSettings?.blurOnIdle && !securityCfg?.pinEnabled) return;
+  IDLE_EVENTS.forEach((event) =>
+    window.addEventListener(event, onActivity, { passive: true })
+  );
+  onActivity();
+}
 
-  appContainer.removeEventListener("mouseenter", handleMouseEnter);
-  appContainer.removeEventListener("mouseleave", handleMouseLeave);
-
-  appContainer.addEventListener("mouseenter", handleMouseEnter);
-  appContainer.addEventListener("mouseleave", handleMouseLeave);
+// ---------------------------------------------------------------------------
+// Observe new content. Mutations are coalesced into one rAF pass so a burst of
+// DOM changes triggers a single re-mark instead of one per mutation.
+// ---------------------------------------------------------------------------
+function scheduleApply() {
+  if (mutationScheduled) return;
+  mutationScheduled = true;
+  requestAnimationFrame(() => {
+    mutationScheduled = false;
+    if (globalEnabled) applyBlurBasedOnSettings();
+  });
 }
 
 function observeNewContent() {
   if (observer) observer.disconnect();
   if (!globalEnabled) return;
 
-  observer = new MutationObserver(() => {
-    setTimeout(() => {
-      if (!globalEnabled) return;
-
-      if (isAppHovered && activeSettings.unblurOnHover) {
-        // If hovered, unblur any new elements immediately
-        Object.keys(SELECTORS).forEach((key) => {
-          document.querySelectorAll(`.privacy-blurred-${key}`).forEach((el) => {
-            if (!el.dataset.originalFilter) {
-              el.dataset.originalFilter = el.style.filter || "blur(8px)";
-            }
-            el.style.filter = "none";
-          });
-        });
-      } else {
-        // Otherwise apply blur normally
-        applyBlurBasedOnSettings();
-      }
-    }, 100);
-  });
-
-  observer.observe(document.body, {
-    childList: true,
-    subtree: true,
-  });
+  observer = new MutationObserver(scheduleApply);
+  observer.observe(document.body, { childList: true, subtree: true });
 }
 
-function init() {
-  chrome.storage.sync.get(
-   ["settings", "globalToggle", "blurValues"],
-    ({ settings, globalToggle, blurValues }) => {
-      activeSettings = settings || {};
-      globalEnabled = !!globalToggle;
-    
+// ---------------------------------------------------------------------------
+// Init / teardown
+// ---------------------------------------------------------------------------
+function teardown() {
+  if (observer) observer.disconnect();
+  clearTimeout(inactivityTimer);
+  clearTimeout(relockTimer);
+  IDLE_EVENTS.forEach((event) => window.removeEventListener(event, onActivity));
+  isIdleBlurred = false;
+  isAppHovered = false;
+  hoverRevealed = null;
+  hideUnlockOverlay();
+  removeAllMarkers();
+  document.documentElement.classList.remove(ROOT_NO_TRANSITION, ROOT_APP_HOVER);
+}
 
-       if (blurValues) {
-        BLUR_AMOUNT = blurValues["blur amount"] || 8;
-       INACTIVITY_TIMEOUT = (blurValues["idle timeout"] || 10) * 1000;
+// freshLoad === true only for the initial injection (page load / reload), where
+// we always re-lock if a PIN is set. EXTENSION_UPDATED re-inits without locking.
+async function init(freshLoad) {
+  const sync = await chrome.storage.sync.get([
+    "settings",
+    "globalToggle",
+    "blurValues",
+  ]);
+  const local = await chrome.storage.local.get(["wpeSecurity", "wpeLock"]);
 
+  activeSettings = sync.settings || {};
+  globalEnabled = !!sync.globalToggle;
+  blurAmount = Number(sync.blurValues?.["blur amount"]) || DEFAULT_BLUR;
+  inactivityTimeout =
+    (Number(sync.blurValues?.["idle timeout"]) || DEFAULT_IDLE_SECONDS) * 1000;
 
-        console.log("blur amount",BLUR_AMOUNT)
-        console.log("blur IDL ITME OUT",INACTIVITY_TIMEOUT)
-      }
+  securityCfg = { ...SECURITY_DEFAULTS, ...(local.wpeSecurity || {}) };
+  lockState = local.wpeLock || { locked: false, unlockedUntil: null };
 
+  if (freshLoad && securityCfg.pinEnabled) {
+    lockState = { locked: true, unlockedUntil: null };
+    chrome.storage.local.set({ wpeLock: lockState });
+  }
 
-      if (!globalEnabled) {
-        if (observer) observer.disconnect();
-        Object.keys(SELECTORS).forEach((key) => removeBlurFromElements(key));
-        isInactiveBlurred = false;
-        return;
-      }
+  injectStyles();
+  setBlurAmount(blurAmount);
 
-      applyBlurBasedOnSettings();
-      setupHoverEffect();
-      observeNewContent();
-      setupAppHover();
-      setupInactivityBlur();
-    }
-  );
+  if (!globalEnabled) {
+    teardown();
+    return;
+  }
+
+  applyBlurBasedOnSettings();
+  setupHoverEffect();
+  observeNewContent();
+  setupAppHover();
+  setupActivity();
+  scheduleRelock();
 }
 
 chrome.runtime.onMessage.addListener((req, sender, sendResponse) => {
   if (req.type === "EXTENSION_UPDATED") {
-    // Clear existing timers
-    clearTimeout(appHoverTimer);
     clearTimeout(inactivityTimer);
-
-    // Reset state
-    isInactiveBlurred = false;
-
-    // Reinitialize everything
-    init();
+    isIdleBlurred = false;
+    init(false);
     sendResponse({ success: true });
   }
-  return true; // Required for async response
+  return true;
 });
 
-init();
+// React to lock/security changes written by the popup or options page.
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area !== "local") return;
+  // Heartbeat from an open settings page — defer idle re-lock, nothing else.
+  if (changes.wpeKeepAlive) {
+    lastKeepAlive = Number(changes.wpeKeepAlive.newValue) || Date.now();
+    return;
+  }
+  let relevant = false;
+  if (changes.wpeLock) {
+    lockState = changes.wpeLock.newValue || { locked: false, unlockedUntil: null };
+    relevant = true;
+  }
+  if (changes.wpeSecurity) {
+    securityCfg = { ...SECURITY_DEFAULTS, ...(changes.wpeSecurity.newValue || {}) };
+    relevant = true;
+  }
+  if (relevant && globalEnabled) {
+    if (!isLocked()) hideUnlockOverlay();
+    applyBlurBasedOnSettings();
+    scheduleRelock();
+  }
+});
+
+init(true);
