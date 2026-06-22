@@ -107,7 +107,10 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 function notifyAllTabs() {
   chrome.tabs.query({ url: "*://web.whatsapp.com/*" }, (tabs) => {
     tabs.forEach((tab) => {
-      chrome.tabs.sendMessage(tab.id, { type: 'EXTENSION_UPDATED' });
+      chrome.tabs.sendMessage(tab.id, { type: 'EXTENSION_UPDATED' }).catch((err) => {
+        // Ignore errors when the receiving end doesn't exist (e.g. content script not loaded yet)
+        console.debug("Could not send update message to tab:", tab.id, err);
+      });
     });
   });
 }

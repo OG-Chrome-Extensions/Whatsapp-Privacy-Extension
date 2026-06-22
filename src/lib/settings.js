@@ -20,22 +20,33 @@ export const DEFAULT_BLUR_VALUES = {
 };
 
 export function sendMessageToExtension(message) {
-  return new Promise((resolve, reject) => {
+  if (!chrome?.runtime?.sendMessage) {
+    return Promise.resolve(null);
+  }
+  return new Promise((resolve) => {
     try {
       chrome.runtime.sendMessage(message, (response) => {
-        if (chrome.runtime.lastError) reject(chrome.runtime.lastError);
-        else resolve(response);
+        if (chrome.runtime.lastError) {
+          console.debug("sendMessageToExtension error (ignored):", chrome.runtime.lastError.message);
+          resolve(null);
+        } else {
+          resolve(response);
+        }
       });
     } catch (error) {
-      reject(error);
+      console.debug("sendMessageToExtension exception (ignored):", error);
+      resolve(null);
     }
   });
 }
 
 export function notifyContentScripts() {
+  if (!chrome?.tabs?.query) return;
   chrome.tabs.query({ url: "*://web.whatsapp.com/*" }, (tabs) => {
     tabs.forEach((tab) =>
-      chrome.tabs.sendMessage(tab.id, { type: "EXTENSION_UPDATED" })
+      chrome.tabs.sendMessage(tab.id, { type: "EXTENSION_UPDATED" }).catch((err) => {
+        console.debug("Could not message tab:", tab.id, err);
+      })
     );
   });
 }
